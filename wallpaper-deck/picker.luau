@@ -124,9 +124,11 @@ local THUMB_MAX_CONCURRENT = 4
 
 local displayedItems = {}
 local selectedIdx = 1
+local isPickerOpen = false
 local render -- forward declaration
 local toggleCurrentFavorite -- forward declaration
 local toggleFavoriteItem -- forward declaration
+local changeSort -- forward declaration
 
 local function isValidFile(path: string?): boolean
   if not path or path == "" then return false end
@@ -285,11 +287,13 @@ local function pumpHiResQueue()
               hiResPending[id] = nil
               if ok and isValidFile(dest) then
                 item.hiResPath = dest
+                item._hiResValid = true
               else
                 pcall(noctalia.removeFile, dest)
               end
               local active = displayedItems[selectedIdx]
               if active and active.id == id and hiResPreview then
+                displayedBgPath = dest
                 if type(render) == "function" then render() end
               end
               pumpHiResQueue()
@@ -302,11 +306,13 @@ local function pumpHiResQueue()
               hiResPending[id] = nil
               if res and res.exitCode == 0 and isValidFile(dest) then
                 item.hiResPath = dest
+                item._hiResValid = true
               else
                 pcall(noctalia.removeFile, dest)
               end
               local active = displayedItems[selectedIdx]
               if active and active.id == id and hiResPreview then
+                displayedBgPath = dest
                 if type(render) == "function" then render() end
               end
               pumpHiResQueue()
@@ -940,11 +946,41 @@ local function refreshConnectedOutputs()
   end
 end
 
+local localSortCache: { [string]: { any } } = {}
+
+local function invalidateSortCache()
+  localSortCache = {}
+end
+
 local function rebuildList()
-  local src = {}
   if currentMode == "wallhaven" then
-    src = wallhavenData.items or {}
-  elseif currentMode == "favorites" then
+    displayedItems = (wallhavenData and wallhavenData.items) or {}
+    cachedRibbon = nil
+    selectedIdx = clamp(selectedIdx, 1, math.max(1, #displayedItems))
+    if #displayedItems > 0 then
+      local halfWindow = math.floor((visibleCards or 7) / 2)
+      for offset = -halfWindow, halfWindow do
+        local it = displayedItems[selectedIdx + offset]
+        if it then
+          requestWallhavenThumb(it, offset == 0)
+        end
+      end
+    end
+    return
+  end
+
+  local hasSearch = (searchQuery ~= "")
+  local cacheKey = currentSort
+
+  if currentMode == "local" and not hasSearch and localSortCache[cacheKey] then
+    displayedItems = localSortCache[cacheKey]
+    cachedRibbon = nil
+    selectedIdx = clamp(selectedIdx, 1, math.max(1, #displayedItems))
+    return
+  end
+
+  local src = {}
+  if currentMode == "favorites" then
     for _, item in ipairs(allWallpapers) do
       if favorites[item.name] then
         if isFlattened or not itemIsSubdir(item) then
@@ -953,14 +989,21 @@ local function rebuildList()
       end
     end
   else
-    for _, item in ipairs(allWallpapers) do
-      if isFlattened or not itemIsSubdir(item) then
-        table.insert(src, item)
+    if localSortCache["name_asc"] and not hasSearch then
+      src = localSortCache["name_asc"]
+    else
+      for _, item in ipairs(allWallpapers) do
+        if isFlattened or not itemIsSubdir(item) then
+          table.insert(src, item)
+        end
+      end
+      if not hasSearch then
+        localSortCache["name_asc"] = src
       end
     end
   end
 
-  if currentMode ~= "wallhaven" and searchQuery ~= "" then
+  if hasSearch then
     local q = string.lower(searchQuery)
     local filtered = {}
     for _, item in ipairs(src) do
@@ -973,52 +1016,99 @@ local function rebuildList()
     src = filtered
   end
 
-  if currentMode ~= "wallhaven" and #src > 1 then
-    if currentSort == "colour" then
-      table.sort(src, function(a, b)
-        local ka = a.hueKey or 3.0
-        local kb = b.hueKey or 3.0
-        if ka ~= kb then return ka < kb end
-        return (a.lowerName or "") < (b.lowerName or "")
-      end)
+  if #src > 1 then
+    if currentSort == "name_desc" then
+      local rev = {}
+      for i = #src, 1, -1 do
+        table.insert(rev, src[i])
+      end
+      src = rev
+    elseif currentSort == "colour" then
+      local withHue = {}
+      local withoutHue = {}
+      for _, it in ipairs(src) do
+        if it.hueKey then
+          table.insert(withHue, it)
+        else
+          table.insert(withoutHue, it)
+        end
+      end
+      if #withHue > 1 then
+        local keys = {}
+        for i, it in ipairs(withHue) do
+          keys[i] = string.format("%08d:%d", math.floor((it.hueKey or 0) * 100000), i)
+        end
+        table.sort(keys)
+        local sortedHue = {}
+        for i, k in ipairs(keys) do
+          local idx = tonumber(string.match(k, ":(%d+)"))
+          sortedHue[i] = withHue[idx]
+        end
+        withHue = sortedHue
+      end
+      for _, it in ipairs(withoutHue) do
+        table.insert(withHue, it)
+      end
+      src = withHue
     elseif currentSort == "newest" then
-      table.sort(src, function(a, b)
-        local ma = a.mtime or 0
-        local mb = b.mtime or 0
-        if ma ~= mb then return ma > mb end
-        return (a.lowerName or "") < (b.lowerName or "")
-      end)
+      local keys = {}
+      for i, it in ipairs(src) do
+        keys[i] = string.format("%012d:%d", 9999999999 - (it.mtime or 0), i)
+      end
+      table.sort(keys)
+      local sorted = {}
+      for i, k in ipairs(keys) do
+        local idx = tonumber(string.match(k, ":(%d+)"))
+        sorted[i] = src[idx]
+      end
+      src = sorted
+      if currentMode == "local" and not hasSearch then
+        localSortCache["newest"] = sorted
+      end
     elseif currentSort == "oldest" then
-      table.sort(src, function(a, b)
-        local ma = a.mtime or 0
-        local mb = b.mtime or 0
-        if ma ~= mb then return ma < mb end
-        return (a.lowerName or "") < (b.lowerName or "")
-      end)
-    elseif currentSort == "name_desc" then
-      table.sort(src, function(a, b)
-        return (a.lowerName or "") > (b.lowerName or "")
-      end)
-    elseif searchQuery ~= "" or currentMode == "favorites" then
-      -- If src is full collection without filter, it's already in name_asc order
-      table.sort(src, function(a, b)
-        return (a.lowerName or "") < (b.lowerName or "")
-      end)
+      local baseNewest = localSortCache["newest"]
+      if not baseNewest then
+        local keys = {}
+        for i, it in ipairs(src) do
+          keys[i] = string.format("%012d:%d", 9999999999 - (it.mtime or 0), i)
+        end
+        table.sort(keys)
+        baseNewest = {}
+        for i, k in ipairs(keys) do
+          local idx = tonumber(string.match(k, ":(%d+)"))
+          baseNewest[i] = src[idx]
+        end
+        if currentMode == "local" and not hasSearch then
+          localSortCache["newest"] = baseNewest
+        end
+      end
+      local rev = {}
+      for i = #baseNewest, 1, -1 do
+        table.insert(rev, baseNewest[i])
+      end
+      src = rev
+    elseif (hasSearch or currentMode == "favorites") and currentSort == "name_asc" then
+      local keys = {}
+      for i, it in ipairs(src) do
+        keys[i] = string.format("%s\t%d", it.lowerName or "", i)
+      end
+      table.sort(keys)
+      local sorted = {}
+      for i, k in ipairs(keys) do
+        local idx = tonumber(string.match(k, "\t(%d+)"))
+        sorted[i] = src[idx]
+      end
+      src = sorted
     end
+  end
+
+  if currentMode == "local" and not hasSearch then
+    localSortCache[cacheKey] = src
   end
 
   displayedItems = src
   cachedRibbon = nil
   selectedIdx = clamp(selectedIdx, 1, math.max(1, #displayedItems))
-  if currentMode == "wallhaven" and #displayedItems > 0 then
-    local halfWindow = math.floor((visibleCards or 7) / 2)
-    for offset = -halfWindow, halfWindow do
-      local it = displayedItems[selectedIdx + offset]
-      if it then
-        requestWallhavenThumb(it, offset == 0)
-      end
-    end
-  end
 end
 
 local function getApiKey(): string
@@ -1603,23 +1693,8 @@ local function buildStandardRow2()
           controlSize = "sm",
           tooltip = (currentSort == "name_asc" or currentSort == "name") and "Name: Ascending (click for Z-A)" or "Name: Descending (click for A-Z)",
           onClick = function()
-            local currentItem = displayedItems[selectedIdx]
-            if currentSort == "name_asc" or currentSort == "name" then
-              currentSort = "name_desc"
-            else
-              currentSort = "name_asc"
-            end
-            rebuildList()
-            if currentItem then
-              for i, it in ipairs(displayedItems) do
-                if it.path == currentItem.path then
-                  selectedIdx = i
-                  break
-                end
-              end
-            end
-            resetDeckAnimation(selectedIdx)
-            render()
+            local nextSort = (currentSort == "name_asc" or currentSort == "name") and "name_desc" or "name_asc"
+            changeSort(nextSort)
           end,
         }),
         ui.button({
@@ -1629,19 +1704,7 @@ local function buildStandardRow2()
           controlSize = "sm",
           tooltip = "Sort by Chromatic Hue",
           onClick = function()
-            local currentItem = displayedItems[selectedIdx]
-            currentSort = "colour"
-            rebuildList()
-            if currentItem then
-              for i, it in ipairs(displayedItems) do
-                if it.path == currentItem.path then
-                  selectedIdx = i
-                  break
-                end
-              end
-            end
-            resetDeckAnimation(selectedIdx)
-            render()
+            changeSort("colour")
           end,
         }),
         ui.button({
@@ -1651,23 +1714,8 @@ local function buildStandardRow2()
           controlSize = "sm",
           tooltip = (currentSort == "newest") and "Newest first (click for Oldest)" or "Oldest first (click for Newest)",
           onClick = function()
-            local currentItem = displayedItems[selectedIdx]
-            if currentSort == "newest" then
-              currentSort = "oldest"
-            else
-              currentSort = "newest"
-            end
-            rebuildList()
-            if currentItem then
-              for i, it in ipairs(displayedItems) do
-                if it.path == currentItem.path then
-                  selectedIdx = i
-                  break
-                end
-              end
-            end
-            resetDeckAnimation(selectedIdx)
-            render()
+            local nextSort = (currentSort == "newest") and "oldest" or "newest"
+            changeSort(nextSort)
           end,
         }),
       }),
@@ -1764,7 +1812,7 @@ end
 
 local function triggerPreview()
   local item = displayedItems[selectedIdx]
-  if not item or not item.path then return end
+  if not item or not (item.path or item.id) then return end
   if currentMode == "wallhaven" then
     requestWallhavenThumb(item, true)
     if hiResPreview then
@@ -1912,30 +1960,37 @@ toggleCurrentFavorite = function()
   toggleFavoriteItem(displayedItems[selectedIdx])
 end
 
-local function cycleSort()
+changeSort = function(newSort: string)
   local currentItem = displayedItems[selectedIdx]
-  if currentSort == "name_asc" or currentSort == "name" then
-    currentSort = "name_desc"
-  elseif currentSort == "name_desc" then
-    currentSort = "colour"
-  elseif currentSort == "colour" then
-    currentSort = "newest"
-  elseif currentSort == "newest" then
-    currentSort = "oldest"
-  else
-    currentSort = "name_asc"
-  end
-  rebuildList()
-  if currentItem then
-    for i, it in ipairs(displayedItems) do
-      if it.path == currentItem.path then
-        selectedIdx = i
-        break
+  local currentPath = currentItem and (currentItem.path or currentItem.id)
+  currentSort = newSort
+  noctalia.runAsync({ "true" }, function()
+    rebuildList()
+    if currentPath and #displayedItems > 0 then
+      for i, it in ipairs(displayedItems) do
+        if (it.path or it.id) == currentPath then
+          selectedIdx = i
+          break
+        end
       end
     end
+    resetDeckAnimation(selectedIdx)
+    noctalia.runAsync({ "true" }, render)
+  end)
+end
+
+local function cycleSort()
+  local nextSort = "name_asc"
+  if currentSort == "name_asc" or currentSort == "name" then
+    nextSort = "name_desc"
+  elseif currentSort == "name_desc" then
+    nextSort = "colour"
+  elseif currentSort == "colour" then
+    nextSort = "newest"
+  elseif currentSort == "newest" then
+    nextSort = "oldest"
   end
-  resetDeckAnimation(selectedIdx)
-  render()
+  changeSort(nextSort)
 end
 
 local function cycleMode()
@@ -2055,13 +2110,17 @@ local function renderCard(item: any, index: number, distSigned: number, scale: n
 
   local chipRows = item._chipRows
   local chipStrip = item._chipStrip
-  if not chipRows or not chipStrip then
-    local colors = item.colors or {}
-    local pCol = colors.primary or "#80a9ff"
-    local sCol = colors.secondary or "#bfc6dc"
-    local tCol = colors.tertiary or "#dfbde4"
-    local pcCol = colors.primary_container or "#20468a"
-    local schCol = colors.surface_container_highest or "#33353b"
+  local colors = item.colors
+  local hasRealColors = (colors and colors.primary and colors.primary ~= "#80a9ff")
+
+  if not chipRows or not chipStrip or item._renderedColors ~= colors then
+    item._renderedColors = colors
+    local cList = colors or {}
+    local pCol = cList.primary or "#80a9ff"
+    local sCol = cList.secondary or "#bfc6dc"
+    local tCol = cList.tertiary or "#dfbde4"
+    local pcCol = cList.primary_container or "#20468a"
+    local schCol = cList.surface_container_highest or "#33353b"
 
     local chips = {
       { label = "PRIMARY", col = pCol },
@@ -2097,7 +2156,6 @@ local function renderCard(item: any, index: number, distSigned: number, scale: n
       }))
     end
     chipRows = rows
-    item._chipRows = rows
 
     chipStrip = ui.row({
       gap = 2,
@@ -2111,7 +2169,19 @@ local function renderCard(item: any, index: number, distSigned: number, scale: n
       ui.box({ fill = pcCol, flexGrow = 1, height = 7, radius = R(2) }),
       ui.box({ fill = schCol, flexGrow = 1, height = 7, radius = R(2) }),
     })
-    item._chipStrip = chipStrip
+
+    if hasRealColors then
+      item._chipRows = chipRows
+      item._chipStrip = chipStrip
+    else
+      item._chipRows = nil
+      item._chipStrip = nil
+    end
+  end
+
+  if currentMode ~= "wallhaven" and not hasRealColors and not item._paletteRequested and item.path then
+    item._paletteRequested = true
+    noctalia.state.set("deck_command", { action = "prioritize_palette", path = item.path })
   end
 
   local chipsElement = (cardH >= 210) and ui.column({ gap = 2 }, chipRows) or chipStrip
@@ -2673,7 +2743,7 @@ function render()
         justify = "center",
       }, {
         (bgPath ~= "") and ui.image({
-          key = "deck_bg_preview_image",
+          key = "deck_bg_preview_image_" .. bgPath,
           path = bgPath,
           width = panelW,
           height = panelH,
@@ -2768,7 +2838,7 @@ function render()
       justify = "center",
     }, {
       (#displayedItems > 0 and bgPath ~= "") and ui.image({
-        key = "deck_bg_preview_image",
+        key = "deck_bg_preview_image_" .. bgPath,
         path = bgPath,
         width = panelW,
         height = panelH,
@@ -3011,6 +3081,8 @@ function render()
                   hiResPreview = not hiResPreview
                   if not hiResPreview then
                     hiResQueue = {}
+                  else
+                    displayedBgPath = ""
                   end
                   triggerPreview()
                   render()
@@ -3028,6 +3100,7 @@ function render()
               checked = isFlattened,
               onChange = function(checked)
                 isFlattened = checked
+                invalidateSortCache()
                 selectedIdx = 1
                 resetDeckAnimation(1.0)
                 rebuildList()
@@ -3266,6 +3339,8 @@ function render()
 end
 
 function onOpen(context: any?)
+  isPickerOpen = true
+  noctalia.state.set("deck_command", { action = "panel_state", open = true })
   updatePanelGeometry()
   updateCornerRadiusScale()
   displayedBgPath = ""
@@ -3425,6 +3500,8 @@ function onKey(chord: string, pressed: boolean)
       hiResPreview = not hiResPreview
       if not hiResPreview then
         hiResQueue = {}
+      else
+        displayedBgPath = ""
       end
       triggerPreview()
       render()
@@ -3505,16 +3582,37 @@ function onIpc(event: string, _payload: string?)
     refreshConnectedOutputs()
     monitorDropdownOpen = not monitorDropdownOpen
     render()
+  elseif event == "sort" or event == "cycle_sort" then
+    cycleSort()
+  elseif event == "sort_name" then
+    changeSort((currentSort == "name_asc" or currentSort == "name") and "name_desc" or "name_asc")
+  elseif event == "sort_newest" then
+    changeSort((currentSort == "newest") and "oldest" or "newest")
+  elseif event == "sort_colour" then
+    changeSort("colour")
+  elseif event == "toggle_hires" or event == "hires" then
+    if currentMode == "wallhaven" then
+      hiResPreview = not hiResPreview
+      if not hiResPreview then
+        hiResQueue = {}
+      else
+        displayedBgPath = ""
+      end
+      triggerPreview()
+      render()
+    end
   end
 end
 
 noctalia.state.watch("wallpapers", function(val)
   if type(val) == "table" then
-    local currentItem = displayedItems and displayedItems[selectedIdx] or nil
-    local currentPath = currentItem and (currentItem.path or currentItem.id) or nil
     allWallpapers = val
+    invalidateSortCache()
     cachedFavCount = -1
     cachedRibbon = nil
+    if not isPickerOpen then return end
+    local currentItem = displayedItems and displayedItems[selectedIdx] or nil
+    local currentPath = currentItem and (currentItem.path or currentItem.id) or nil
     rebuildList()
     if currentPath and #displayedItems > 0 then
       local found = false
@@ -3534,6 +3632,42 @@ noctalia.state.watch("wallpapers", function(val)
     end
     triggerPreview()
     render()
+  end
+end)
+
+noctalia.state.watch("palette_update", function(update)
+  if type(update) == "table" and update.path and update.colors then
+    local changed = false
+    if displayedItems then
+      for _, it in ipairs(displayedItems) do
+        if it.path == update.path then
+          it.colors = update.colors
+          it.sourceColor = update.sourceColor
+          it.hueKey = update.hueKey
+          it._chipRows = nil
+          it._chipStrip = nil
+          it._renderedColors = nil
+          changed = true
+          break
+        end
+      end
+    end
+    if allWallpapers then
+      for _, it in ipairs(allWallpapers) do
+        if it.path == update.path then
+          it.colors = update.colors
+          it.sourceColor = update.sourceColor
+          it.hueKey = update.hueKey
+          it._chipRows = nil
+          it._chipStrip = nil
+          it._renderedColors = nil
+          break
+        end
+      end
+    end
+    if changed and isPickerOpen then
+      render()
+    end
   end
 end)
 
@@ -3650,9 +3784,11 @@ function onConfigChanged()
 end
 
 function onClose()
+  isPickerOpen = false
   stopWheelListener()
   if isPeeking then
     isPeeking = false
   end
+  noctalia.state.set("deck_command", { action = "panel_state", open = false })
   noctalia.state.set("deck_command", { action = "prune_cache", nonce = noctalia.nowMs() })
 end
