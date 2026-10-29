@@ -356,13 +356,15 @@ local function scheduleCacheAndStateSync(deck: { any }, cache: { [string]: any }
     noctalia.runAsync({ "true" }, function()
       syncInProgress = false
       if not cacheNeedsSave then return end
-      saveCache(cache, deck)
-      local deckJson = noctalia.json.encode(deck)
-      if deckJson then
-        writeTextFile(DECK_FILE, deckJson)
-      end
+      pcall(saveCache, cache, deck)
       noctalia.state.set("wallpapers", deck)
       cacheNeedsSave = false
+      noctalia.runAsync({ "true" }, function()
+        local ok, deckJson = pcall(noctalia.json.encode, deck)
+        if ok and deckJson then
+          writeTextFile(DECK_FILE, deckJson)
+        end
+      end)
     end)
   end
 end
@@ -623,6 +625,8 @@ local function processScanOutput(stdout: string, dirs: {string}, primaryDir: str
               local thumb = nil
               local preview = nil
               local resStr = nil
+              local topLum = nil
+              local isLight = nil
 
               if cached and (cached.mtime == mtime or mtime == 0) and (cached.size == size or size == 0) then
                 colors = cached.colors
@@ -631,6 +635,8 @@ local function processScanOutput(stdout: string, dirs: {string}, primaryDir: str
                 thumb = cached.thumb
                 preview = cached.preview
                 resStr = cached.res
+                topLum = cached.topLum
+                isLight = cached.isLight
               end
 
               local key = hashKey(filePath)
@@ -664,6 +670,8 @@ local function processScanOutput(stdout: string, dirs: {string}, primaryDir: str
                 colors = colors,
                 sourceColor = sourceColor,
                 hueKey = hueKey,
+                topLum = topLum,
+                isLight = isLight,
                 isSubdir = isSubdir,
                 relDir = relDir,
               }
@@ -691,36 +699,10 @@ local function processScanOutput(stdout: string, dirs: {string}, primaryDir: str
     noctalia.runAsync({ "true" }, function()
       if token ~= scanToken then return end
 
-      local maxDeck = tonumber(noctalia.getConfig("max_deck_wallpapers")) or 600
       local selectedDeck = results
-      if maxDeck > 0 and #results > maxDeck then
-        selectedDeck = {}
-        local favItems = {}
-        local otherItems = {}
-        for _, it in ipairs(results) do
-          if favorites[it.name] then
-            table.insert(favItems, it)
-          else
-            table.insert(otherItems, it)
-          end
-        end
-        for _, it in ipairs(favItems) do
-          table.insert(selectedDeck, it)
-        end
-        local remaining = math.max(0, maxDeck - #favItems)
-        for i = 1, math.min(remaining, #otherItems) do
-          table.insert(selectedDeck, otherItems[i])
-        end
-      end
-
       table.sort(selectedDeck, function(a, b)
         return a.lowerName < b.lowerName
       end)
-
-      local deckJson = noctalia.json.encode(selectedDeck)
-      if deckJson then
-        writeTextFile(DECK_FILE, deckJson)
-      end
 
       noctalia.state.set("wallpapers", selectedDeck)
       noctalia.state.set("wallpaper_dir", primaryDir)
@@ -728,6 +710,14 @@ local function processScanOutput(stdout: string, dirs: {string}, primaryDir: str
 
       isScanning = false
       noctalia.state.set("is_scanning", false)
+
+      -- Save deck to disk asynchronously in background so it never blocks or exceeds CPU budget
+      noctalia.runAsync({ "true" }, function()
+        local ok, deckJson = pcall(noctalia.json.encode, selectedDeck)
+        if ok and deckJson then
+          writeTextFile(DECK_FILE, deckJson)
+        end
+      end)
 
       -- Start async background workers
       pumpMatugenQueue(token, cache, selectedDeck)
@@ -754,10 +744,12 @@ local function scanWallpapers(targetDir: string?)
   -- If wallpapers state is currently empty, load cached deck immediately so UI displays wallpapers without waiting
   local currentWps = noctalia.state.get("wallpapers")
   if not currentWps or (type(currentWps) == "table" and #currentWps == 0) then
-    local cached = loadDeckFromDisk()
-    if #cached > 0 then
-      noctalia.state.set("wallpapers", cached)
-    end
+    pcall(function()
+      local cached = loadDeckFromDisk()
+      if #cached > 0 then
+        noctalia.state.set("wallpapers", cached)
+      end
+    end)
   end
 
   noctalia.mkdirAll(STATE_DIR)
