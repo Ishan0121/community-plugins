@@ -693,16 +693,25 @@ local function processScanOutput(stdout: string, dirs: {string}, primaryDir: str
       local line = rawLines[i]
       local trimmed = string.match(line, "^%s*(.-)%s*$")
       if trimmed and trimmed ~= "" then
+        local fileName = nil
         local filePath, sizeStr, mtimeStr
         if hasStats then
-          local tab1 = string.find(trimmed, "\t")
+          local tab1 = string.find(trimmed, "\t", 1, true)
           if tab1 then
-            filePath = string.sub(trimmed, 1, tab1 - 1)
-            local tab2 = string.find(trimmed, "\t", tab1 + 1)
+            local tab2 = string.find(trimmed, "\t", tab1 + 1, true)
             if tab2 then
-              sizeStr = string.sub(trimmed, tab1 + 1, tab2 - 1)
-              mtimeStr = string.sub(trimmed, tab2 + 1)
+              local tab3 = string.find(trimmed, "\t", tab2 + 1, true)
+              fileName = string.sub(trimmed, 1, tab1 - 1)
+              filePath = string.sub(trimmed, tab1 + 1, tab2 - 1)
+              if tab3 then
+                sizeStr = string.sub(trimmed, tab2 + 1, tab3 - 1)
+                mtimeStr = string.sub(trimmed, tab3 + 1)
+              else
+                sizeStr = string.sub(trimmed, tab2 + 1)
+                mtimeStr = "0"
+              end
             else
+              filePath = string.sub(trimmed, 1, tab1 - 1)
               sizeStr = string.sub(trimmed, tab1 + 1)
               mtimeStr = "0"
             end
@@ -717,7 +726,9 @@ local function processScanOutput(stdout: string, dirs: {string}, primaryDir: str
           local isHidden = (string.find(filePath, "/%.") ~= nil)
           if not isHidden then
             seen[filePath] = true
-            local fileName = fastFileName(filePath)
+            if not fileName or fileName == "" then
+              fileName = fastFileName(filePath)
+            end
             if fileName and string.sub(fileName, 1, 1) ~= "." then
               local base, ext = fastBaseAndExt(fileName)
               local size = tonumber(sizeStr) or 0
@@ -796,9 +807,6 @@ local function processScanOutput(stdout: string, dirs: {string}, primaryDir: str
               end
               table.insert(results, item)
 
-              if not item.sourceColor or item.sourceColor == "#4285f4" then
-                table.insert(matugenQueue, item)
-              end
               if not effectiveThumb then
                 table.insert(thumbQueue, item)
               end
@@ -818,21 +826,8 @@ local function processScanOutput(stdout: string, dirs: {string}, primaryDir: str
     noctalia.runAsync({ "true" }, function()
       if token ~= scanToken then return end
 
+      -- results is ALREADY sorted Name A-Z natively by sort -f in find command!
       local selectedDeck = results
-      if #selectedDeck > 1 then
-        local keys = {}
-        for i, it in ipairs(selectedDeck) do
-          keys[i] = string.format("%s\t%d", it.lowerName or "", i)
-        end
-        table.sort(keys)
-        local sorted = {}
-        for i, k in ipairs(keys) do
-          local idx = tonumber(string.match(k, "\t(%d+)"))
-          sorted[i] = selectedDeck[idx]
-        end
-        selectedDeck = sorted
-      end
-
       activeDeckInMemory = selectedDeck
       activeCacheInMemory = cache
 
@@ -853,10 +848,55 @@ local function processScanOutput(stdout: string, dirs: {string}, primaryDir: str
           end
         end)
 
-        -- Start async background workers in their own decoupled tick
+        -- Generate and broadcast newestDeck and colourDeck in decoupled async ticks
+        local isSub = if scanSubdirs == nil then true else (scanSubdirs == true or scanSubdirs == "true" or scanSubdirs == 1)
+        local depthPart = if not isSub then "-maxdepth 1 " else ""
+        local newestCmd = { "sh", "-c", [[find -L "$@" ]] .. depthPart .. [[\( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" -o -iname "*.gif" -o -iname "*.bmp" -o -iname "*.avif" \) -printf "%T@\t%p\n" | sort -rn | cut -f 2]], "sh" }
+        for _, d in ipairs(dirs) do table.insert(newestCmd, d) end
+
+        noctalia.runAsync(newestCmd, function(nRes)
+          if token ~= scanToken then return end
+          if nRes and nRes.exitCode == 0 and nRes.stdout and nRes.stdout ~= "" then
+            local byPath = {}
+            for _, it in ipairs(selectedDeck) do
+              if it.path then byPath[it.path] = it end
+            end
+            local newestDeck = {}
+            local pLines = string.split(nRes.stdout, "\n")
+            for _, p in ipairs(pLines) do
+              local it = byPath[p]
+              if it then table.insert(newestDeck, it) end
+            end
+            if #newestDeck > 0 then
+              noctalia.state.set("wallpapers_newest", newestDeck)
+            end
+          end
+
+          -- Decoupled async tick for colour deck (only items with hueKey, safe instruction count):
+          noctalia.runAsync({ "true" }, function()
+            if token ~= scanToken then return end
+            local withHue = {}
+            local withoutHue = {}
+            for _, it in ipairs(selectedDeck) do
+              if it.hueKey then
+                table.insert(withHue, it)
+              else
+                table.insert(withoutHue, it)
+              end
+            end
+            if #withHue > 1 then
+              table.sort(withHue, function(a, b) return (a.hueKey or 0) < (b.hueKey or 0) end)
+            end
+            for _, it in ipairs(withoutHue) do
+              table.insert(withHue, it)
+            end
+            noctalia.state.set("wallpapers_colour", withHue)
+          end)
+        end)
+
+        -- Start thumbnail generator for items without thumbnails
         noctalia.runAsync({ "true" }, function()
           if token ~= scanToken then return end
-          pumpMatugenQueue(token, cache, selectedDeck)
           pumpThumbQueue(token, cache, selectedDeck)
         end)
       end)
@@ -880,17 +920,6 @@ local function scanWallpapers(targetDir: any?)
   noctalia.state.set("wallpaper_dir", primaryDir)
   noctalia.state.set("wallpaper_dirs", dirs)
 
-  -- If wallpapers state is currently empty, load cached deck asynchronously so UI displays wallpapers without waiting
-  local currentWps = noctalia.state.get("wallpapers")
-  if not currentWps or (type(currentWps) == "table" and #currentWps == 0) then
-    noctalia.runAsync({ "true" }, function()
-      local cached = loadDeckFromDisk()
-      if #cached > 0 then
-        noctalia.state.set("wallpapers", cached)
-      end
-    end)
-  end
-
   noctalia.mkdirAll(STATE_DIR)
   noctalia.mkdirAll(THUMB_DIR)
 
@@ -908,40 +937,16 @@ local function scanWallpapers(targetDir: any?)
     scanSubdirs = (scanSubdirs == true or scanSubdirs == "true" or scanSubdirs == 1)
   end
 
-  local findArgs = { "find", "-L" }
+  local depthArg = if not scanSubdirs then "-maxdepth 1 " else ""
+  local findArgs = {
+    "sh",
+    "-c",
+    [[find -L "$@" ]] .. depthArg .. [[\( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" -o -iname "*.gif" -o -iname "*.bmp" -o -iname "*.avif" \) -printf "%f\t%p\t%s\t%T@\n" | sort -f]],
+    "sh",
+  }
   for _, d in ipairs(dirs) do
     table.insert(findArgs, d)
   end
-  if not scanSubdirs then
-    table.insert(findArgs, "-maxdepth")
-    table.insert(findArgs, "1")
-  end
-  table.insert(findArgs, "-type")
-  table.insert(findArgs, "f")
-  table.insert(findArgs, "(")
-  table.insert(findArgs, "-iname")
-  table.insert(findArgs, "*.jpg")
-  table.insert(findArgs, "-o")
-  table.insert(findArgs, "-iname")
-  table.insert(findArgs, "*.jpeg")
-  table.insert(findArgs, "-o")
-  table.insert(findArgs, "-iname")
-  table.insert(findArgs, "*.png")
-  table.insert(findArgs, "-o")
-  table.insert(findArgs, "-iname")
-  table.insert(findArgs, "*.webp")
-  table.insert(findArgs, "-o")
-  table.insert(findArgs, "-iname")
-  table.insert(findArgs, "*.gif")
-  table.insert(findArgs, "-o")
-  table.insert(findArgs, "-iname")
-  table.insert(findArgs, "*.bmp")
-  table.insert(findArgs, "-o")
-  table.insert(findArgs, "-iname")
-  table.insert(findArgs, "*.avif")
-  table.insert(findArgs, ")")
-  table.insert(findArgs, "-printf")
-  table.insert(findArgs, "%p\t%s\t%T@\n")
 
   noctalia.runAsync(findArgs, function(res)
     if myToken ~= scanToken then
@@ -1459,9 +1464,7 @@ noctalia.state.watch("deck_command", function(cmd)
     downloadAndApplyWallhaven(cmd.item, cmd.output, cmd.cachedPath)
     prunePreviewCache()
   elseif action == "prioritize_palette" and cmd.path then
-    noctalia.runAsync({ "true" }, function()
-      prioritizePalette(cmd.path)
-    end)
+    prioritizePalette(cmd.path)
   elseif action == "panel_state" then
     pickerPanelOpen = (cmd.open == true)
     if not pickerPanelOpen and #activeDeckInMemory > 0 then

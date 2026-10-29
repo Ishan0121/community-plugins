@@ -44,6 +44,8 @@ end
 
 local stateWps = noctalia.state.get("wallpapers")
 local allWallpapers = (type(stateWps) == "table" and #stateWps > 0) and stateWps or loadCacheDirect()
+local allWallpapersNewest: { any }? = noctalia.state.get("wallpapers_newest")
+local allWallpapersColour: { any }? = noctalia.state.get("wallpapers_colour")
 local stateFavs = noctalia.state.get("favorites")
 local favorites = (type(stateFavs) == "table" and next(stateFavs) ~= nil) and stateFavs or loadFavoritesDirect()
 local activeWallpaper = noctalia.state.get("active_wallpaper") or ""
@@ -125,7 +127,8 @@ local THUMB_MAX_CONCURRENT = 4
 local displayedItems = {}
 local selectedIdx = 1
 local isPickerOpen = false
-local render -- forward declaration
+local currentMode = "local" -- "local" | "favorites" | "wallhaven"
+local render: () -> ()
 local toggleCurrentFavorite -- forward declaration
 local toggleFavoriteItem -- forward declaration
 local changeSort -- forward declaration
@@ -165,6 +168,14 @@ local function pumpThumbQueue()
               if ok and isValidFile(dest) then
                 item.thumb = dest
                 item.preview = dest
+                if displayedItems then
+                  for _, it in ipairs(displayedItems) do
+                    if it.id == id then
+                      it.thumb = dest
+                      it.preview = dest
+                    end
+                  end
+                end
                 if type(render) == "function" then render() end
               else
                 pcall(noctalia.removeFile, dest)
@@ -179,6 +190,14 @@ local function pumpThumbQueue()
               if res and res.exitCode == 0 and isValidFile(dest) then
                 item.thumb = dest
                 item.preview = dest
+                if displayedItems then
+                  for _, it in ipairs(displayedItems) do
+                    if it.id == id then
+                      it.thumb = dest
+                      it.preview = dest
+                    end
+                  end
+                end
                 if type(render) == "function" then render() end
               else
                 pcall(noctalia.removeFile, dest)
@@ -240,7 +259,7 @@ local hiResPreview = noctalia.getConfig("wallhaven_hires_preview") == true
 local hiResQueue = {}
 local hiResPending = {}
 local hiResActive = 0
-local HIRES_MAX_CONCURRENT = 1
+local HIRES_MAX_CONCURRENT = 2
 
 local function pumpHiResQueue()
   if not hiResPreview then return end
@@ -255,6 +274,22 @@ local function pumpHiResQueue()
       local dest = WALLHAVEN_PREVIEW_DIR .. "/" .. id .. "." .. ext
       if isValidFile(dest) then
         item.hiResPath = dest
+        item._hiResValid = true
+        if displayedItems then
+          for _, it in ipairs(displayedItems) do
+            if it.id == id then
+              it.hiResPath = dest
+              it._hiResValid = true
+            end
+          end
+        end
+        local active = displayedItems[selectedIdx]
+        if active and active.id == id and hiResPreview then
+          if displayedBgPath ~= dest then
+            displayedBgPath = dest
+            if type(render) == "function" then render() end
+          end
+        end
       else
         -- Remove corrupt/partial file if it exists but is invalid
         if noctalia.fileExists(dest) then
@@ -271,7 +306,15 @@ local function pumpHiResQueue()
           local pf = pdir .. "/wallhaven-" .. id .. "." .. ext
           if isValidFile(pf) then
             item.hiResPath = pf
+            item._hiResValid = true
             alreadySaved = true
+            local active = displayedItems[selectedIdx]
+            if active and active.id == id and hiResPreview then
+              if displayedBgPath ~= pf then
+                displayedBgPath = pf
+                if type(render) == "function" then render() end
+              end
+            end
             break
           end
         end
@@ -280,42 +323,42 @@ local function pumpHiResQueue()
           hiResPending[id] = true
           hiResActive = hiResActive + 1
 
-          local started = false
-          if type(noctalia.download) == "function" then
-            started = noctalia.download(item.fullUrl, dest, function(ok)
-              hiResActive = math.max(0, hiResActive - 1)
-              hiResPending[id] = nil
-              if ok and isValidFile(dest) then
-                item.hiResPath = dest
-                item._hiResValid = true
-              else
-                pcall(noctalia.removeFile, dest)
+          local onDownloadDone = function(ok: boolean)
+            hiResActive = math.max(0, hiResActive - 1)
+            hiResPending[id] = nil
+            if ok and isValidFile(dest) then
+              item.hiResPath = dest
+              item._hiResValid = true
+              if displayedItems then
+                for _, it in ipairs(displayedItems) do
+                  if it.id == id then
+                    it.hiResPath = dest
+                    it._hiResValid = true
+                  end
+                end
               end
               local active = displayedItems[selectedIdx]
               if active and active.id == id and hiResPreview then
                 displayedBgPath = dest
                 if type(render) == "function" then render() end
               end
-              pumpHiResQueue()
+            else
+              pcall(noctalia.removeFile, dest)
+            end
+            pumpHiResQueue()
+          end
+
+          local started = false
+          if type(noctalia.download) == "function" then
+            started = noctalia.download(item.fullUrl, dest, function(ok)
+              onDownloadDone(ok == true)
             end)
           end
 
           if not started then
-            noctalia.runAsync({ "curl", "-sL", "-o", dest, item.fullUrl }, function(res)
-              hiResActive = math.max(0, hiResActive - 1)
-              hiResPending[id] = nil
-              if res and res.exitCode == 0 and isValidFile(dest) then
-                item.hiResPath = dest
-                item._hiResValid = true
-              else
-                pcall(noctalia.removeFile, dest)
-              end
-              local active = displayedItems[selectedIdx]
-              if active and active.id == id and hiResPreview then
-                displayedBgPath = dest
-                if type(render) == "function" then render() end
-              end
-              pumpHiResQueue()
+            noctalia.runAsync({ "curl", "-sL", "--connect-timeout", "10", "-o", dest, item.fullUrl }, function(res)
+              local ok = (res and res.exitCode == 0 and isValidFile(dest))
+              onDownloadDone(ok)
             end)
           end
         end
@@ -324,20 +367,22 @@ local function pumpHiResQueue()
   end
 end
 
-local function requestWallhavenHiRes(item: any, priority: boolean?): string?
-  if not item or not item.id or not item.fullUrl then return nil end
+local function getWallhavenHiResCached(item: any): string?
+  if not item or not item.id then return nil end
   if item.hiResPath and item._hiResValid then
     return item.hiResPath
   end
-  if item.hiResPath and isValidFile(item.hiResPath) then
-    item._hiResValid = true
-    return item.hiResPath
-  end
-  local urlExt = string.match(item.fullUrl, "%.([^%.]+)$") or item.ext or "jpg"
+  local urlExt = string.match(item.fullUrl or "", "%.([^%.]+)$") or item.ext or "jpg"
   local ext = string.lower(urlExt)
   if ext == "jpeg" then ext = "jpg" end
 
-  -- Check if already saved in permanent wallpapers
+  local dest = WALLHAVEN_PREVIEW_DIR .. "/" .. item.id .. "." .. ext
+  if isValidFile(dest) then
+    item.hiResPath = dest
+    item._hiResValid = true
+    return dest
+  end
+
   local permanentDirs = {
     noctalia.expandPath("~/Pictures/Wallpapers/WallHaven"),
     noctalia.expandPath("~/Pictures/Wallpapers"),
@@ -364,17 +409,18 @@ local function requestWallhavenHiRes(item: any, priority: boolean?): string?
       return pfPng
     end
   end
+  return nil
+end
 
+local function requestWallhavenHiRes(item: any, priority: boolean?): string?
+  if not item or not item.id or not item.fullUrl then return nil end
+  local cached = getWallhavenHiResCached(item)
+  if cached then return cached end
+
+  local urlExt = string.match(item.fullUrl, "%.([^%.]+)$") or item.ext or "jpg"
+  local ext = string.lower(urlExt)
+  if ext == "jpeg" then ext = "jpg" end
   local dest = WALLHAVEN_PREVIEW_DIR .. "/" .. item.id .. "." .. ext
-  if isValidFile(dest) then
-    item.hiResPath = dest
-    item._hiResValid = true
-    return dest
-  end
-  -- Remove 0-byte/corrupt cached file so re-download is triggered
-  if noctalia.fileExists(dest) then
-    pcall(noctalia.removeFile, dest)
-  end
 
   if not hiResPending[item.id] then
     local inQueueIdx = nil
@@ -385,8 +431,7 @@ local function requestWallhavenHiRes(item: any, priority: boolean?): string?
       end
     end
 
-    local isPriority = (priority == true) or (priority == nil and displayedItems[selectedIdx] and displayedItems[selectedIdx].id == item.id)
-    if isPriority then
+    if priority == true then
       if inQueueIdx then
         table.remove(hiResQueue, inQueueIdx)
       end
@@ -403,7 +448,43 @@ local function requestWallhavenHiRes(item: any, priority: boolean?): string?
   return nil
 end
 
-local currentMode = "local" -- "local" | "favorites" | "wallhaven"
+local function onCardSettled()
+  if currentMode ~= "wallhaven" or not hiResPreview then return end
+  local item = displayedItems[selectedIdx]
+  if not item or not item.id or not item.fullUrl then return end
+
+  local cached = getWallhavenHiResCached(item)
+  if cached then
+    if displayedBgPath ~= cached then
+      displayedBgPath = cached
+      if type(render) == "function" then render() end
+    end
+  else
+    requestWallhavenHiRes(item, true)
+  end
+
+  -- User convenience: also download high resolution of the next 2 cards in background
+  for offset = 1, 2 do
+    local nextItem = displayedItems[selectedIdx + offset]
+    if nextItem and nextItem.id and nextItem.fullUrl then
+      if not getWallhavenHiResCached(nextItem) then
+        requestWallhavenHiRes(nextItem, false)
+      end
+    end
+  end
+end
+
+local settleToken = 0
+local function scheduleSettle()
+  if currentMode ~= "wallhaven" or not hiResPreview then return end
+  settleToken = settleToken + 1
+  local myToken = settleToken
+  noctalia.runAsync({ "sleep", "0.2" }, function()
+    if myToken ~= settleToken or not isPickerOpen then return end
+    onCardSettled()
+  end)
+end
+
 local currentSort = "name_asc"  -- "name_asc" | "name_desc" | "colour" | "newest" | "oldest"
 local searchQuery = ""
 local searchActive = false
@@ -606,7 +687,6 @@ local function getDeckScale(panelW: number): number
 end
 
 local visibleCards = VISIBLE_DECK_CARDS
-local render: () -> ()
 
 local function getScreenGeometry()
   local w = 1920
@@ -946,10 +1026,17 @@ local function refreshConnectedOutputs()
   end
 end
 
-local localSortCache: { [string]: { any } } = {}
+local function reverseArray(arr: { any }): { any }
+  local n = #arr
+  local rev = table.create(n)
+  for i = 1, n do
+    rev[i] = arr[n - i + 1]
+  end
+  return rev
+end
 
 local function invalidateSortCache()
-  localSortCache = {}
+  -- No-op: sorting uses pre-sorted arrays and fast pointer assignments
 end
 
 local function rebuildList()
@@ -970,14 +1057,6 @@ local function rebuildList()
   end
 
   local hasSearch = (searchQuery ~= "")
-  local cacheKey = currentSort
-
-  if currentMode == "local" and not hasSearch and localSortCache[cacheKey] then
-    displayedItems = localSortCache[cacheKey]
-    cachedRibbon = nil
-    selectedIdx = clamp(selectedIdx, 1, math.max(1, #displayedItems))
-    return
-  end
 
   local src = {}
   if currentMode == "favorites" then
@@ -988,122 +1067,104 @@ local function rebuildList()
         end
       end
     end
+    if hasSearch then
+      local q = string.lower(searchQuery)
+      local filtered = {}
+      for _, item in ipairs(src) do
+        local ln = item.lowerName or string.lower(item.name or "")
+        local rel = item.relDir and string.lower(item.relDir) or ""
+        if string.find(ln, q, 1, true) or (rel ~= "" and string.find(rel, q, 1, true)) then
+          table.insert(filtered, item)
+        end
+      end
+      src = filtered
+    end
+    if #src > 1 and #src <= 300 then
+      if currentSort == "name_desc" then
+        table.sort(src, function(a, b) return (a.lowerName or "") > (b.lowerName or "") end)
+      elseif currentSort == "newest" then
+        table.sort(src, function(a, b) return (a.mtime or 0) > (b.mtime or 0) end)
+      elseif currentSort == "oldest" then
+        table.sort(src, function(a, b) return (a.mtime or 0) < (b.mtime or 0) end)
+      elseif currentSort == "colour" then
+        table.sort(src, function(a, b) return (a.hueKey or 0) < (b.hueKey or 0) end)
+      else
+        table.sort(src, function(a, b) return (a.lowerName or "") < (b.lowerName or "") end)
+      end
+    end
   else
-    if localSortCache["name_asc"] and not hasSearch then
-      src = localSortCache["name_asc"]
-    else
+    -- Local mode
+    if hasSearch then
+      local q = string.lower(searchQuery)
+      local filtered = {}
       for _, item in ipairs(allWallpapers) do
         if isFlattened or not itemIsSubdir(item) then
-          table.insert(src, item)
+          local ln = item.lowerName or string.lower(item.name or "")
+          local rel = item.relDir and string.lower(item.relDir) or ""
+          if string.find(ln, q, 1, true) or (rel ~= "" and string.find(rel, q, 1, true)) then
+            table.insert(filtered, item)
+          end
         end
       end
-      if not hasSearch then
-        localSortCache["name_asc"] = src
-      end
-    end
-  end
-
-  if hasSearch then
-    local q = string.lower(searchQuery)
-    local filtered = {}
-    for _, item in ipairs(src) do
-      local ln = item.lowerName or string.lower(item.name or "")
-      local rel = item.relDir and string.lower(item.relDir) or ""
-      if string.find(ln, q, 1, true) or (rel ~= "" and string.find(rel, q, 1, true)) then
-        table.insert(filtered, item)
-      end
-    end
-    src = filtered
-  end
-
-  if #src > 1 then
-    if currentSort == "name_desc" then
-      local rev = {}
-      for i = #src, 1, -1 do
-        table.insert(rev, src[i])
-      end
-      src = rev
-    elseif currentSort == "colour" then
-      local withHue = {}
-      local withoutHue = {}
-      for _, it in ipairs(src) do
-        if it.hueKey then
-          table.insert(withHue, it)
+      src = filtered
+      if #src > 1 and #src <= 300 then
+        if currentSort == "name_desc" then
+          table.sort(src, function(a, b) return (a.lowerName or "") > (b.lowerName or "") end)
+        elseif currentSort == "newest" then
+          table.sort(src, function(a, b) return (a.mtime or 0) > (b.mtime or 0) end)
+        elseif currentSort == "oldest" then
+          table.sort(src, function(a, b) return (a.mtime or 0) < (b.mtime or 0) end)
+        elseif currentSort == "colour" then
+          table.sort(src, function(a, b) return (a.hueKey or 0) < (b.hueKey or 0) end)
         else
-          table.insert(withoutHue, it)
+          table.sort(src, function(a, b) return (a.lowerName or "") < (b.lowerName or "") end)
         end
       end
-      if #withHue > 1 then
-        local keys = {}
-        for i, it in ipairs(withHue) do
-          keys[i] = string.format("%08d:%d", math.floor((it.hueKey or 0) * 100000), i)
+    else
+      -- Zero CPU overhead: uses pre-sorted arrays or pure array index reversal
+      if isFlattened then
+        if currentSort == "name_asc" then
+          src = allWallpapers
+        elseif currentSort == "name_desc" then
+          src = reverseArray(allWallpapers)
+        elseif currentSort == "newest" then
+          src = allWallpapersNewest or allWallpapers
+        elseif currentSort == "oldest" then
+          src = reverseArray(allWallpapersNewest or allWallpapers)
+        elseif currentSort == "colour" then
+          src = allWallpapersColour or allWallpapers
+        else
+          src = allWallpapers
         end
-        table.sort(keys)
-        local sortedHue = {}
-        for i, k in ipairs(keys) do
-          local idx = tonumber(string.match(k, ":(%d+)"))
-          sortedHue[i] = withHue[idx]
+      else
+        local base = {}
+        for _, it in ipairs(allWallpapers) do
+          if not itemIsSubdir(it) then
+            table.insert(base, it)
+          end
         end
-        withHue = sortedHue
-      end
-      for _, it in ipairs(withoutHue) do
-        table.insert(withHue, it)
-      end
-      src = withHue
-    elseif currentSort == "newest" then
-      local keys = {}
-      for i, it in ipairs(src) do
-        keys[i] = string.format("%012d:%d", 9999999999 - (it.mtime or 0), i)
-      end
-      table.sort(keys)
-      local sorted = {}
-      for i, k in ipairs(keys) do
-        local idx = tonumber(string.match(k, ":(%d+)"))
-        sorted[i] = src[idx]
-      end
-      src = sorted
-      if currentMode == "local" and not hasSearch then
-        localSortCache["newest"] = sorted
-      end
-    elseif currentSort == "oldest" then
-      local baseNewest = localSortCache["newest"]
-      if not baseNewest then
-        local keys = {}
-        for i, it in ipairs(src) do
-          keys[i] = string.format("%012d:%d", 9999999999 - (it.mtime or 0), i)
-        end
-        table.sort(keys)
-        baseNewest = {}
-        for i, k in ipairs(keys) do
-          local idx = tonumber(string.match(k, ":(%d+)"))
-          baseNewest[i] = src[idx]
-        end
-        if currentMode == "local" and not hasSearch then
-          localSortCache["newest"] = baseNewest
+        if currentSort == "name_desc" then
+          src = reverseArray(base)
+        elseif currentSort == "newest" then
+          if #base <= 300 then
+            table.sort(base, function(a, b) return (a.mtime or 0) > (b.mtime or 0) end)
+          end
+          src = base
+        elseif currentSort == "oldest" then
+          if #base <= 300 then
+            table.sort(base, function(a, b) return (a.mtime or 0) < (b.mtime or 0) end)
+          end
+          src = base
+        elseif currentSort == "colour" then
+          if #base <= 300 then
+            table.sort(base, function(a, b) return (a.hueKey or 0) < (b.hueKey or 0) end)
+          end
+          src = base
+        else
+          src = base
         end
       end
-      local rev = {}
-      for i = #baseNewest, 1, -1 do
-        table.insert(rev, baseNewest[i])
-      end
-      src = rev
-    elseif (hasSearch or currentMode == "favorites") and currentSort == "name_asc" then
-      local keys = {}
-      for i, it in ipairs(src) do
-        keys[i] = string.format("%s\t%d", it.lowerName or "", i)
-      end
-      table.sort(keys)
-      local sorted = {}
-      for i, k in ipairs(keys) do
-        local idx = tonumber(string.match(k, "\t(%d+)"))
-        sorted[i] = src[idx]
-      end
-      src = sorted
     end
-  end
-
-  if currentMode == "local" and not hasSearch then
-    localSortCache[cacheKey] = src
   end
 
   displayedItems = src
@@ -1815,15 +1876,6 @@ local function triggerPreview()
   if not item or not (item.path or item.id) then return end
   if currentMode == "wallhaven" then
     requestWallhavenThumb(item, true)
-    if hiResPreview then
-      requestWallhavenHiRes(item, true)
-      for offset = 1, 2 do
-        local nextItem = displayedItems[selectedIdx + offset]
-        if nextItem then
-          requestWallhavenHiRes(nextItem, false)
-        end
-      end
-    end
     checkWallhavenLazyLoad()
     return
   end
@@ -1857,8 +1909,13 @@ local function selectCardIndex(newIdx: number)
   local clamped = clamp(newIdx, 1, #displayedItems)
   if clamped == selectedIdx then return end
   selectedIdx = clamped
+  hiResQueue = {}
   startDeckAnimation(clamped)
   triggerPreview()
+  scheduleSettle()
+  if not animateSelected then
+    onCardSettled()
+  end
   if type(render) == "function" then
     render()
   end
@@ -1964,19 +2021,17 @@ changeSort = function(newSort: string)
   local currentItem = displayedItems[selectedIdx]
   local currentPath = currentItem and (currentItem.path or currentItem.id)
   currentSort = newSort
-  noctalia.runAsync({ "true" }, function()
-    rebuildList()
-    if currentPath and #displayedItems > 0 then
-      for i, it in ipairs(displayedItems) do
-        if (it.path or it.id) == currentPath then
-          selectedIdx = i
-          break
-        end
+  rebuildList()
+  if currentPath and #displayedItems > 0 then
+    for i, it in ipairs(displayedItems) do
+      if (it.path or it.id) == currentPath then
+        selectedIdx = i
+        break
       end
     end
-    resetDeckAnimation(selectedIdx)
-    noctalia.runAsync({ "true" }, render)
-  end)
+  end
+  resetDeckAnimation(selectedIdx)
+  render()
 end
 
 local function cycleSort()
@@ -2008,6 +2063,9 @@ local function cycleMode()
   resetDeckAnimation(1.0)
   rebuildList()
   triggerPreview()
+  if currentMode == "wallhaven" then
+    onCardSettled()
+  end
   render()
 end
 
@@ -2699,8 +2757,8 @@ function render()
   if activeItem then
     if currentMode == "wallhaven" then
       if hiResPreview then
-        local hiRes = requestWallhavenHiRes(activeItem)
-        if hiRes and hiRes ~= "" and (activeItem._hiResValid or noctalia.fileExists(hiRes)) then
+        local hiRes = getWallhavenHiResCached(activeItem)
+        if hiRes and hiRes ~= "" then
           activeBg = hiRes
         else
           activeBg = requestWallhavenThumb(activeItem, true) or ""
@@ -3046,6 +3104,8 @@ function render()
                 doWallhavenSearch(true)
               end
               rebuildList()
+              triggerPreview()
+              onCardSettled()
               render()
             end,
           }),
@@ -3083,6 +3143,7 @@ function render()
                     hiResQueue = {}
                   else
                     displayedBgPath = ""
+                    onCardSettled()
                   end
                   triggerPreview()
                   render()
@@ -3416,6 +3477,7 @@ function onOpen(context: any?)
   lastPreviewed = ""
   triggerPreview()
   panel.setNeedsFrameTick(false)
+  onCardSettled()
   render()
 end
 
@@ -3424,6 +3486,7 @@ function onFrameTick(deltaMs: number)
     animatedPos = selectedIdx
     animVel = 0.0
     panel.setNeedsFrameTick(false)
+    onCardSettled()
     render()
     return
   end
@@ -3442,9 +3505,13 @@ function onFrameTick(deltaMs: number)
 
   local diff = animatedPos - animTargetPos
   if math.abs(diff) < 0.002 and math.abs(animVel) < 0.05 then
+    local wasMoving = (animatedPos ~= animTargetPos or animVel ~= 0.0)
     animatedPos = animTargetPos
     animVel = 0.0
     panel.setNeedsFrameTick(false)
+    if wasMoving then
+      onCardSettled()
+    end
   else
     -- Critically damped spring simulation (omega = 26.0):
     -- Unconditionally stable analytic solution, zero jitter, seamless momentum preservation
@@ -3502,6 +3569,7 @@ function onKey(chord: string, pressed: boolean)
         hiResQueue = {}
       else
         displayedBgPath = ""
+        onCardSettled()
       end
       triggerPreview()
       render()
@@ -3597,10 +3665,31 @@ function onIpc(event: string, _payload: string?)
         hiResQueue = {}
       else
         displayedBgPath = ""
+        onCardSettled()
       end
       triggerPreview()
       render()
     end
+  elseif event == "cycle_mode" or event == "mode" or event == "tab" then
+    cycleMode()
+  elseif event == "mode_wallhaven" or event == "wallhaven" then
+    currentMode = "wallhaven"
+    selectedIdx = 1
+    resetDeckAnimation(1.0)
+    if #((wallhavenData and wallhavenData.items) or {}) == 0 then
+      doWallhavenSearch(true)
+    end
+    rebuildList()
+    triggerPreview()
+    onCardSettled()
+    render()
+  elseif event == "mode_local" or event == "local" then
+    currentMode = "local"
+    selectedIdx = 1
+    resetDeckAnimation(1.0)
+    rebuildList()
+    triggerPreview()
+    render()
   end
 end
 
@@ -3632,6 +3721,26 @@ noctalia.state.watch("wallpapers", function(val)
     end
     triggerPreview()
     render()
+  end
+end)
+
+noctalia.state.watch("wallpapers_newest", function(val)
+  if type(val) == "table" and #val > 0 then
+    allWallpapersNewest = val
+    if isPickerOpen and currentMode == "local" and (currentSort == "newest" or currentSort == "oldest") and searchQuery == "" then
+      rebuildList()
+      render()
+    end
+  end
+end)
+
+noctalia.state.watch("wallpapers_colour", function(val)
+  if type(val) == "table" and #val > 0 then
+    allWallpapersColour = val
+    if isPickerOpen and currentMode == "local" and currentSort == "colour" and searchQuery == "" then
+      rebuildList()
+      render()
+    end
   end
 end)
 
@@ -3721,6 +3830,7 @@ noctalia.state.watch("wallhaven_results", function(value)
     rebuildList()
     if wasAppend then
       selectedIdx = prevIdx
+      scheduleSettle()
       -- Pre-queue thumbnails for next cards in newly appended batch
       local batchToPreload = value.newBatch or {}
       for i = 1, math.min(#batchToPreload, 6) do
@@ -3733,6 +3843,7 @@ noctalia.state.watch("wallhaven_results", function(value)
       selectedIdx = 1
       resetDeckAnimation(1.0)
       triggerPreview()
+      onCardSettled()
     end
     if #displayedItems > 0 then
       local halfWindow = math.floor((visibleCards or 7) / 2)
