@@ -272,6 +272,10 @@ local function detectActiveWallpaper()
   end)
 end
 
+local activeDeckInMemory: { any } = {}
+local activeCacheInMemory: { [string]: any } = {}
+local scanSubdirs = true
+
 local function loadDeckFromDisk(): {any}
   local targetFile = DECK_FILE
   if not noctalia.fileExists(targetFile) then
@@ -296,9 +300,6 @@ local function loadDeckFromDisk(): {any}
   end
   return {}
 end
-
-local activeDeckInMemory: { any } = {}
-local activeCacheInMemory: { [string]: any } = {}
 
 local matugenQueue = {}
 local matugenActive = 0
@@ -930,11 +931,11 @@ local function scanWallpapers(targetDir: any?)
     return
   end
 
-  local scanSubdirs = noctalia.getConfig("scan_subdirectories")
-  if scanSubdirs == nil then
+  local cfgSub = noctalia.getConfig("scan_subdirectories")
+  if cfgSub == nil then
     scanSubdirs = true
   else
-    scanSubdirs = (scanSubdirs == true or scanSubdirs == "true" or scanSubdirs == 1)
+    scanSubdirs = (cfgSub == true or cfgSub == "true" or cfgSub == 1)
   end
 
   local depthArg = if not scanSubdirs then "-maxdepth 1 " else ""
@@ -1072,6 +1073,7 @@ local WALLHAVEN_PREVIEW_DIR = noctalia.expandPath("~/.cache/noctalia/wallhaven-p
 
 local currentWallhavenItems = {}
 local activeWallhavenFilters = {}
+local activeWallhavenQuery = ""
 
 local function prunePreviewCache()
   local maxMb = tonumber(noctalia.getConfig("wallhaven_cache_limit_mb")) or 300
@@ -1151,8 +1153,10 @@ local function searchWallhaven(query: string, pageNum: number, append: boolean?,
 
   if append == true then
     filters = filters or activeWallhavenFilters
+    query = (query and query ~= "") and query or activeWallhavenQuery
   else
     activeWallhavenFilters = filters or {}
+    activeWallhavenQuery = query or ""
   end
   filters = filters or {}
 
@@ -1171,6 +1175,9 @@ local function searchWallhaven(query: string, pageNum: number, append: boolean?,
 
   if sorting == "relevance" and (query == nil or query == "") then
     sorting = "date_added"
+  end
+  if query and query ~= "" and (sorting == "hot" or sorting == "toplist") then
+    sorting = "relevance"
   end
 
   local params = {
@@ -1318,7 +1325,10 @@ local function searchWallhaven(query: string, pageNum: number, append: boolean?,
     elseif #currentWallhavenItems == 0 then
       local existing = noctalia.state.get("wallhaven_results")
       if type(existing) == "table" and type(existing.items) == "table" then
-        currentWallhavenItems = existing.items
+        currentWallhavenItems = {}
+        for _, it in ipairs(existing.items) do
+          table.insert(currentWallhavenItems, it)
+        end
       end
     end
     for _, it in ipairs(results) do

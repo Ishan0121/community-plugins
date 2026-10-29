@@ -128,6 +128,7 @@ local displayedItems = {}
 local selectedIdx = 1
 local isPickerOpen = false
 local currentMode = "local" -- "local" | "favorites" | "wallhaven"
+local pendingStepAfterAppend = false
 local render: () -> ()
 local toggleCurrentFavorite -- forward declaration
 local toggleFavoriteItem -- forward declaration
@@ -1242,6 +1243,10 @@ end
 
 local function getActiveFilters(): any
   local sorting, order = getSortingParam()
+  local trimmed = noctalia.string.trim(whQuery or "")
+  if trimmed ~= "" and (sorting == "hot" or sorting == "toplist") then
+    sorting = "relevance"
+  end
   local res, resMode = getResolutionParam()
   local ratio = getRatioParam()
   return {
@@ -1259,6 +1264,7 @@ local function doWallhavenSearch(resetPage: boolean?)
   local targetPage = resetPage and 1 or (wallhavenData.page or 1)
   wallhavenLoadingMore = false
   wallhavenError = nil
+  pendingStepAfterAppend = false
   if resetPage then
     selectedIdx = 1
     resetDeckAnimation(1.0)
@@ -1909,6 +1915,7 @@ local function selectCardIndex(newIdx: number)
   local clamped = clamp(newIdx, 1, #displayedItems)
   if clamped == selectedIdx then return end
   selectedIdx = clamped
+  pendingStepAfterAppend = false
   hiResQueue = {}
   startDeckAnimation(clamped)
   triggerPreview()
@@ -3014,6 +3021,11 @@ function render()
                 onSubmit = function(val)
                   if currentMode == "wallhaven" then
                     whQuery = val or ""
+                    local trimmed = noctalia.string.trim(whQuery)
+                    if trimmed ~= "" and (whSortIdx == 0 or whSortIdx == 1 or whSortIdx == 2) then
+                      whSortIdx = 5 -- auto-switch to relevance for keyword search
+                      noctalia.state.set("wallhaven_sort", "relevance")
+                    end
                     doWallhavenSearch(true)
                   else
                     searchQuery = val or ""
@@ -3031,6 +3043,10 @@ function render()
                 onClick = function()
                   if currentMode == "wallhaven" then
                     whQuery = ""
+                    if whSortIdx == 5 then
+                      whSortIdx = 0 -- revert to date_added when query is cleared
+                      noctalia.state.set("wallhaven_sort", "date_added")
+                    end
                     doWallhavenSearch(true)
                   else
                     searchQuery = ""
@@ -3048,6 +3064,11 @@ function render()
               variant = "primary",
               controlSize = "sm",
               onClick = function()
+                local trimmed = noctalia.string.trim(whQuery or "")
+                if trimmed ~= "" and (whSortIdx == 0 or whSortIdx == 1 or whSortIdx == 2) then
+                  whSortIdx = 5 -- auto-switch to relevance for keyword search
+                  noctalia.state.set("wallhaven_sort", "relevance")
+                end
                 doWallhavenSearch(true)
               end,
             }) or ui.spacer({ width = 1 }),
@@ -3404,6 +3425,7 @@ function onOpen(context: any?)
   noctalia.state.set("deck_command", { action = "panel_state", open = true })
   updatePanelGeometry()
   updateCornerRadiusScale()
+  animateSelected = noctalia.getConfig("animate_selected_card") ~= false
   displayedBgPath = ""
   cachedFavCount = -1
   cachedRibbon = nil
@@ -3535,6 +3557,7 @@ function onKey(chord: string, pressed: boolean)
     if selectedIdx < #displayedItems then
       selectCardIndex(selectedIdx + 1)
     else
+      pendingStepAfterAppend = true
       checkWallhavenLazyLoad()
     end
   elseif chord == "up" or chord == "k" or chord == "u" then
@@ -3547,6 +3570,7 @@ function onKey(chord: string, pressed: boolean)
     if newIdx ~= selectedIdx then
       selectCardIndex(newIdx)
     else
+      pendingStepAfterAppend = true
       checkWallhavenLazyLoad()
     end
   elseif chord == "return" then
@@ -3592,6 +3616,7 @@ function onKey(chord: string, pressed: boolean)
     if selectedIdx < #displayedItems then
       selectCardIndex(selectedIdx + 1)
     else
+      pendingStepAfterAppend = true
       checkWallhavenLazyLoad()
     end
   elseif chord == "escape" then
@@ -3626,6 +3651,7 @@ function onScroll(_axis: any, steps: number, _startsGesture: any)
     if selectedIdx < #displayedItems then
       selectCardIndex(selectedIdx + 1)
     else
+      pendingStepAfterAppend = true
       checkWallhavenLazyLoad()
     end
   elseif stepVal > 0 then
@@ -3644,6 +3670,7 @@ function onIpc(event: string, _payload: string?)
     if selectedIdx < #displayedItems then
       selectCardIndex(selectedIdx + 1)
     else
+      pendingStepAfterAppend = true
       checkWallhavenLazyLoad()
     end
   elseif event == "toggle_monitor" or event == "monitor" then
@@ -3829,8 +3856,13 @@ noctalia.state.watch("wallhaven_results", function(value)
   if currentMode == "wallhaven" then
     rebuildList()
     if wasAppend then
-      selectedIdx = prevIdx
-      scheduleSettle()
+      if pendingStepAfterAppend and #displayedItems > prevIdx then
+        pendingStepAfterAppend = false
+        selectCardIndex(prevIdx + 1)
+      else
+        selectedIdx = prevIdx
+        scheduleSettle()
+      end
       -- Pre-queue thumbnails for next cards in newly appended batch
       local batchToPreload = value.newBatch or {}
       for i = 1, math.min(#batchToPreload, 6) do
@@ -3877,6 +3909,7 @@ end)
 function onConfigChanged()
   updatePanelGeometry()
   updateCornerRadiusScale()
+  animateSelected = noctalia.getConfig("animate_selected_card") ~= false
   local cfgDir = noctalia.getConfig("wallpaper_dir")
   if cfgDir and cfgDir ~= "" then
     local exp = noctalia.expandPath(cfgDir)
